@@ -1014,6 +1014,26 @@ def _normalize_codex_response(response: Any, *, issuer_kind: Optional[str] = Non
     if not final_text and (scan.saw_final_answer_phase or not scan.saw_commentary_phase):
         out_text = getattr(response, "output_text", "")
         final_text = out_text.strip() if isinstance(out_text, str) else final_text
+    # Codex commentary-phase routing can send the assistant's actual response text
+    # to reasoning_parts instead of content_parts, leaving content empty despite
+    # tool_calls being present. Promote substantive reasoning text to content in
+    # that case; the turn is complete (tool_calls present), so empty content is a bug.
+    # Also promote when there are no tool_calls: the commentary phase IS the response
+    # channel for some Codex backends, and trapping the text in reasoning makes the
+    # turn empty → incomplete → continuation loop.
+    if not final_text and reasoning_parts:
+        promoted = "\n\n".join(reasoning_parts).strip()
+        if promoted:
+            logger.warning(
+                "Codex routed %d chars of assistant text to reasoning (%s phase) "
+                "alongside tool_calls=%s; promoting to content so the turn is not empty.",
+                len(promoted),
+                "commentary" if scan.saw_commentary_phase else "unknown",
+                bool(tool_calls),
+            )
+            final_text = promoted
+            reasoning_parts = []
+
     # Tool-call leak recovery: gpt-5.x sometimes emits the intended ``function_call`` as plain Harmony text
     # (``to=functions.foo {json}``). Treat as incomplete so the continuation re-elicits a real call; clear the garbage.
     leaked_tool_call_text = bool(final_text and not tool_calls and _TOOL_CALL_LEAK_PATTERN.search(final_text))

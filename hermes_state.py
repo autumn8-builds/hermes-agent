@@ -538,6 +538,33 @@ class SessionDB(
         # Set True when this instance is opened via hermes_state_registry.acquire(). Makes close() a no-op so the
         # registry (not individual callers) controls the connection lifecycle (#90837).
         self._shared_registry_owned = False
+
+        # ── Registry handoff: bare SessionDB(db_path=path) opened when the registry
+        # already published a shared handle for the same resolved path must NOT open its
+        # own writer connection. This runs INSIDE acquire()'s lifecycle_lock window, so
+        # the lock ordering (lifecycle_lock -> _lock) must not be inverted by _adopt_shared_handle
+        # which also acquires _lock (deadlock with release()'s _lock -> lifecycle_lock path).
+        # Instead of inlining the adoption here, set a flag that acquire() checks AFTER
+        # _open_session_db returns and handles under _lock only.
+        # Read-only opens and bare SessionDB() callers that want their own connection set
+        # _hermes_bypass_registry_handoff on the class before construction (tests, one-shots).
+        self._hermes_bypass_registry_handoff = getattr(self.__class__, "_hermes_bypass_registry_handoff", False)
+        self._pending_adoption = (
+            not self._hermes_bypass_registry_handoff
+            and not read_only
+        )
+        if self._pending_adoption:
+            try:
+                from hermes_state_registry import _generations, _db_path_of
+                self._pending_adoption_path = self.db_path.resolve() if self.db_path.name != "~" else self.db_path
+                for gen in _generations.values():
+                    gen_path = _db_path_of(gen.db)
+                    if gen_path is not None and gen_path.resolve() == self._pending_adoption_path and gen.db is not self:
+                        self._pending_adoption_target = gen
+                        break
+            except Exception:
+                self._pending_adoption = False
+
         initialization_complete = False
         try:
             if read_only:
@@ -551,6 +578,22 @@ class SessionDB(
                 self._open_writer()
             self._record_db_file_identity()
             initialization_complete = True
+            # ── Register bare SessionDB() with the process-wide registry ──────────────────────
+            # Skip when: this instance adopted a shared handle (it's already in the registry
+            # under the adopted handle's identity), was opened by the registry (acquire sets
+            # _shared_registry_owned and the registry's _Generation wraps it), or is a
+            # pending adoption that hasn't been resolved yet (acquire() will handle it).
+            if (not self._shared_registry_owned
+                    and not self._hermes_bypass_registry_handoff
+                    and self._conn is not None
+                    and not getattr(self, "_pending_adoption", False)):
+                try:
+                    from hermes_state_registry import _generations, _Generation, _stat_db_file_identity as _stat_id
+                    resolved = self.db_path.resolve()
+                    if _generations.get(resolved) is None:
+                        _generations[resolved] = _Generation(resolved, self, _stat_id(resolved))
+                except Exception:
+                    pass  # don't let registry failure break the open
         except Exception as exc:
             # Surface WHY via /resume and friends; callers keep their ``_session_db = None`` path.
             _set_last_init_error(f"{type(exc).__name__}: {exc}")
@@ -824,6 +867,11 @@ class SessionDB(
             return
         with self._lock:
             if self._conn is None:  # close() raced a still-unwinding reader
+                if self.read_only:
+                    raise sqlite3.ProgrammingError(
+                        f"SessionDB for {self.db_path} was opened read-only and "
+                        f"the connection was closed; cannot serve a read after close()"
+                    )
                 self._reopen_after_close_locked(context="read")
             yield cast(sqlite3.Connection, self._conn)
 
@@ -834,8 +882,8 @@ class SessionDB(
         ``self._lock``. No _init_schema: no DDL races with siblings during teardown."""
         if self.read_only:
             raise sqlite3.ProgrammingError(
-                f"SessionDB for {self.db_path} was closed (read-only handle); "
-                f"cannot serve a {context} after close()"
+                f"SessionDB for {self.db_path} was opened read-only and cannot "
+                f"serve a {context} after close()"
             )
         # A reopen resolves the PATH again: a replaced file would be written through stale WAL/shm
         # assumptions; a quarantined handle must never hand a fresh connection to a damaged file.
@@ -894,7 +942,12 @@ class SessionDB(
             try:
                 with self._lock:
                     self._raise_if_db_replaced()
-                    if self._conn is None:  # close() raced this writer
+                    if self._conn is None:
+                        if self.read_only:
+                            raise sqlite3.ProgrammingError(
+                                f"SessionDB for {self.db_path} was opened read-only and "
+                                f"the connection was closed; cannot serve a write after close()"
+                            )
                         self._reopen_after_close_locked(context="write")
                     self._conn.execute("BEGIN IMMEDIATE")
                     try:
@@ -1419,6 +1472,63 @@ class SessionDB(
                 self.close()
             except Exception:
                 pass
+
+    # ── Registry handoff helper ─────────────────────────────────────────────────────────────
+    # When a bare SessionDB(db_path=...) is constructed and the registry already published a
+    # shared handle for the same resolved path, adopt that handle instead of opening a duplicate
+    # writer connection. See #98573.
+    def _adopt_shared_handle(self, shared: "SessionDB") -> None:
+        """Take over *shared*'s connection, lock, and registry-owned flag; the caller is now
+        the registry's problem to release (it borrowed via acquire() just above)."""
+        self._conn = shared._conn
+        self._lock = shared._lock
+        # Read-path state: the shared handle already registered this object in its budget
+        # (we passed self to _read_budget.register above). The shared handle's own registration
+        # was for a different object — drop it so the budget's WeakSet doesn't pin a dead wrapper.
+        # The shared handle will be released by the registry on its last holder's close(), which
+        # is exactly when this adopted connection should be torn down.
+        shared._read_budget._members.discard(shared)
+        self._read_budget.register(self)
+        self._shared_registry_owned = True
+        self._wal_active = shared._wal_active
+        self._db_sidecar_identity = dict(shared._db_sidecar_identity)
+        self._db_file_identity = shared._db_file_identity
+        self._db_file_application_id = shared._db_file_application_id
+        self._fts_enabled = shared._fts_enabled
+        self._fts_stale = shared._fts_stale
+        self._fts_cjk_loaded = shared._fts_cjk_loaded
+        self._fts_cjk_available = shared._fts_cjk_available
+        self._fts_unavailable_warned = shared._fts_unavailable_warned
+        self._fts_usermerge_floor_applied = shared._fts_usermerge_floor_applied
+        self._trigram_available = shared._trigram_available
+        self._db_corrupt = shared._db_corrupt
+        self._db_corrupt_reason = shared._db_corrupt_reason
+        self._db_replaced = shared._db_replaced
+        self._db_wal_generation_lost = shared._db_wal_generation_lost
+        self._retired_generation_capture = shared._retired_generation_capture
+        self._connection_pinned = shared._connection_pinned
+        self._retire_connection = shared._retire_connection
+        # Token writer: the shared handle may have one running; borrow it.
+        self._token_queue = shared._token_queue
+        self._token_queue_cond = shared._token_queue_cond
+        self._token_writer_thread = shared._token_writer_thread
+        self._token_writer_stop = shared._token_writer_stop
+        self._token_atexit_hook = shared._token_atexit_hook
+        # The shared handle's __dict__ is about to be released by the registry; clear its
+        # reference to the connection so its close() (if it ever runs) is a no-op.
+        shared._conn = None
+        shared._shared_registry_owned = False
+        # ── Update the registry: this new object is now the generation's live handle ──────────
+        # The registry stores _Generation(path, db, identity). When db2 adopts db1's connection,
+        # db1 still owns the registry slot. Update it so release(db2) finds the generation.
+        try:
+            from hermes_state_registry import _generations
+            for gen in _generations.values():
+                if gen.db is shared:
+                    gen.db = self
+                    break
+        except Exception:
+            pass
 
     # ── Async token accounting (SessionUsageMixin) ──
     # queue_token_counts() is a deque append; a single-writer thread applies deltas in

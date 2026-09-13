@@ -266,13 +266,15 @@ class SessionManager:
         return state
 
     def _get_db(self):
-        """Lazily initialise the SessionDB; ``None`` if unavailable (e.g. import error in a
-        minimal test env). ``HERMES_HOME`` is resolved here, not via the import-time
-        ``DEFAULT_DB_PATH``, so test fixtures that change the env var later are honoured."""
+        """Lazily initialise the SessionDB via the process-wide registry so the ACP adapter
+        shares the gateway's writer connection instead of opening a second one that the
+        registry will adopt (and then clear) on the next acquire() call — leaving this
+        instance with _conn=None and a stale ProgrammingError on next use (#105567)."""
         if self._db_instance is None:
             try:
                 from hermes_state import SessionDB
-                self._db_instance = SessionDB(db_path=get_hermes_home() / "state.db")
+                from hermes_state_registry import acquire
+                self._db_instance = acquire(db_path=get_hermes_home() / "state.db")
             except Exception:
                 logger.debug("SessionDB unavailable for ACP persistence", exc_info=True)
         return self._db_instance
